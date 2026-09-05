@@ -818,6 +818,18 @@ name = "deccp-core"
 version = "0.1.0"
 
 [[patch.unused]]
+name = "qomm-avalanche-vm"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "qomm-defmi"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "zkpi-defmi-sdk"
+version = "0.1.0"
+
+[[patch.unused]]
 name = "qomm-audit"
 version = "0.1.0"
 
@@ -843,18 +855,6 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "qomm-transport"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "qomm-avalanche-vm"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "qomm-defmi"
-version = "0.1.0"
-
-[[patch.unused]]
-name = "zkpi-defmi-sdk"
 version = "0.1.0"
 
 [[patch.unused]]

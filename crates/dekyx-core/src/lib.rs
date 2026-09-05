@@ -18,23 +18,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
 use zkfmi_crypto::{
-    backend::{Ed25519Signer, MlDsa65Signer},
+    backend::{Ed25519Signer, MlDsa65Signer, MlDsa65Verifier},
     hybrid::signature::{HybridSignature, HybridSigner, HybridVerifier},
     key::KeyPurpose,
-    suite::{Suite, SuiteId, ML_DSA_65_PK_BYTES},
-    traits::Signer as _,
+    suite::{Suite, SuiteId, ML_DSA_65_PK_BYTES, ML_DSA_65_SIG_BYTES},
+    traits::{SecretBytes, Signer as _, Verifier as _},
 };
 
 pub type Digest32 = [u8; 32];
 pub type Identifier = [u8; 32];
 pub const ZERO: [u8; 32] = [0; 32];
-const CREDENTIAL_DOMAIN: &[u8] = b"DEKYX:CREDENTIAL:v2";
-const ISSUANCE_REQUEST_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-REQUEST:v1";
-const ISSUANCE_PROOF_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-PROOF:v1";
+const CREDENTIAL_DOMAIN: &[u8] = b"DEKYX:CREDENTIAL:v3";
+const ISSUANCE_REQUEST_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-REQUEST:v2";
+const ISSUANCE_PROOF_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-PROOF:v2";
 const STATUS_DOMAIN: &[u8] = b"DEKYX:STATUS-LIST:v2";
 const CONTEXT_DOMAIN: &[u8] = b"DEKYX:PRESENTATION-CONTEXT:v1";
 const PROOF_DOMAIN: &[u8] = b"DEKYX:ANONYMOUS-PRESENTATION:v1";
-const PRESENTATION_DOMAIN: &[u8] = b"DEKYX:PRESENTATION-DIGEST:v1";
+const PRESENTATION_DOMAIN: &[u8] = b"DEKYX:PRESENTATION-DIGEST:v2";
 const QUALIFICATION_LEAF_DOMAIN: &[u8] = b"DEKYX:QUALIFICATION-LEAF:v1";
 const QUALIFICATION_NODE_DOMAIN: &[u8] = b"DEKYX:QUALIFICATION-NODE:v1";
 const BLINDING_GENERATOR_DOMAIN: &[u8] = b"DEKYX:SUBJECT-BLINDING-GENERATOR:v1";
@@ -484,6 +484,8 @@ pub struct Credential {
     pub issuer_key_epoch: u64,
     pub subject_kind: SubjectKind,
     pub subject_commitment: [u8; 32],
+    pub holder_public_key: Vec<u8>,
+    pub holder_suite: Suite,
     pub scope_digest: Digest32,
     pub policy_digest: Digest32,
     pub qualifications_root: Digest32,
@@ -512,6 +514,11 @@ impl Credential {
             return Err(DeKyxError::InvalidCredential);
         }
         decompress_non_identity(self.subject_commitment)?;
+        if self.holder_suite != Suite::new(SuiteId::MlDsa65)
+            || self.holder_public_key.len() != ML_DSA_65_PK_BYTES
+        {
+            return Err(DeKyxError::InvalidCredential);
+        }
         let mut hash = Sha256::new();
         hash.update(CREDENTIAL_DOMAIN);
         hash.update(self.credential_id);
@@ -519,6 +526,8 @@ impl Credential {
         hash.update(self.issuer_key_epoch.to_be_bytes());
         hash.update([self.subject_kind.tag()]);
         hash.update(self.subject_commitment);
+        hash.update(self.holder_suite.encode());
+        hash.update(&self.holder_public_key);
         hash.update(self.scope_digest);
         hash.update(self.policy_digest);
         hash.update(self.qualifications_root);
@@ -557,6 +566,17 @@ pub struct CredentialWitness {
     subject_secret: Scalar,
     blinding: Scalar,
     qualifications: Vec<Qualification>,
+    holder_key: MlDsa65Signer,
+}
+
+fn fresh_holder_key<R: RngCore + CryptoRng>(rng: &mut R) -> MlDsa65Signer {
+    let mut seed = SecretBytes::new(vec![0; 32]);
+    rng.fill_bytes(&mut seed);
+    MlDsa65Signer::from_seed(
+        seed.as_slice()
+            .try_into()
+            .expect("fixed holder seed length"),
+    )
 }
 
 impl CredentialWitness {
@@ -568,13 +588,31 @@ impl CredentialWitness {
         while secret == Scalar::ZERO {
             secret = Scalar::random(&mut *rng);
         }
-        Self::from_scalars(secret, Scalar::random(rng), qualifications)
+        Self::from_scalars_with_holder(
+            secret,
+            Scalar::random(&mut *rng),
+            qualifications,
+            fresh_holder_key(rng),
+        )
     }
 
+    /// Create a new witness with an independent fresh PQ holder key.
+    /// Restoring an issued credential requires its original holder key through
+    /// `from_scalars_with_holder`; the curve scalars cannot reconstruct it.
     pub fn from_scalars(
         subject_secret: Scalar,
         blinding: Scalar,
         qualifications: Vec<Qualification>,
+    ) -> Result<Self, DeKyxError> {
+        let holder_key = MlDsa65Signer::generate().map_err(|_| DeKyxError::InvalidWitness)?;
+        Self::from_scalars_with_holder(subject_secret, blinding, qualifications, holder_key)
+    }
+
+    pub fn from_scalars_with_holder(
+        subject_secret: Scalar,
+        blinding: Scalar,
+        qualifications: Vec<Qualification>,
+        holder_key: MlDsa65Signer,
     ) -> Result<Self, DeKyxError> {
         if subject_secret == Scalar::ZERO {
             return Err(DeKyxError::InvalidWitness);
@@ -584,18 +622,28 @@ impl CredentialWitness {
             subject_secret,
             blinding,
             qualifications,
+            holder_key,
         })
     }
 
     /// Keeps the subject secret and qualifications while drawing a fresh
-    /// blinding, so a credential for another scope carries a commitment that is
-    /// not publicly linkable to this one.
+    /// blinding and independent PQ key for a new credential. No holder public
+    /// key is reused to link credentials across scopes.
     pub fn rerandomize<R: RngCore + CryptoRng>(&self, rng: &mut R) -> Self {
         Self {
             subject_secret: self.subject_secret,
-            blinding: Scalar::random(rng),
+            blinding: Scalar::random(&mut *rng),
             qualifications: self.qualifications.clone(),
+            holder_key: fresh_holder_key(rng),
         }
+    }
+
+    pub fn holder_public_key(&self) -> Vec<u8> {
+        self.holder_key.public_key()
+    }
+
+    pub fn holder_suite(&self) -> Suite {
+        self.holder_key.suite()
     }
 
     pub fn subject_commitment(&self) -> [u8; 32] {
@@ -625,6 +673,8 @@ impl CredentialWitness {
         rng: &mut R,
     ) -> Result<CredentialIssuanceProof, DeKyxError> {
         if request.subject_commitment != self.subject_commitment()
+            || request.holder_public_key != self.holder_public_key()
+            || request.holder_suite != self.holder_suite()
             || canonical_qualifications(&request.qualifications)? != self.qualifications
         {
             return Err(DeKyxError::MismatchedWitnessOrContext);
@@ -637,11 +687,20 @@ impl CredentialWitness {
             .compress()
             .to_bytes();
         let challenge = issuance_challenge(request, &announcement_commitment)?;
-        Ok(CredentialIssuanceProof {
+        let mut proof = CredentialIssuanceProof {
             announcement_commitment,
             response_subject: (nonce_subject + challenge * self.subject_secret).to_bytes(),
             response_blinding: (nonce_blinding + challenge * self.blinding).to_bytes(),
-        })
+            holder_signature: Vec::new(),
+        };
+        proof.holder_signature = self
+            .holder_key
+            .sign(
+                KeyPurpose::Attestation,
+                &proof.holder_signing_message(request)?,
+            )
+            .map_err(|_| DeKyxError::InvalidIssuanceProof)?;
+        Ok(proof)
     }
 }
 
@@ -658,6 +717,8 @@ pub struct CredentialRequest {
     pub issuer_key_epoch: u64,
     pub subject_kind: SubjectKind,
     pub subject_commitment: [u8; 32],
+    pub holder_public_key: Vec<u8>,
+    pub holder_suite: Suite,
     pub scope_digest: Digest32,
     pub policy_digest: Digest32,
     pub qualifications: Vec<Qualification>,
@@ -684,6 +745,11 @@ impl CredentialRequest {
             return Err(DeKyxError::InvalidCredential);
         }
         decompress_non_identity(self.subject_commitment)?;
+        if self.holder_suite != Suite::new(SuiteId::MlDsa65)
+            || self.holder_public_key.len() != ML_DSA_65_PK_BYTES
+        {
+            return Err(DeKyxError::InvalidCredential);
+        }
         let qualifications_root = qualification_root(&self.qualifications)?;
         Ok(digest_fields(
             ISSUANCE_REQUEST_DOMAIN,
@@ -693,6 +759,8 @@ impl CredentialRequest {
                 &self.issuer_key_epoch.to_be_bytes(),
                 &[self.subject_kind.tag()],
                 &self.subject_commitment,
+                &self.holder_suite.encode(),
+                &self.holder_public_key,
                 &self.scope_digest,
                 &self.policy_digest,
                 &qualifications_root,
@@ -710,10 +778,34 @@ pub struct CredentialIssuanceProof {
     pub announcement_commitment: [u8; 32],
     pub response_subject: [u8; 32],
     pub response_blinding: [u8; 32],
+    pub holder_signature: Vec<u8>,
 }
 
 impl CredentialIssuanceProof {
+    pub fn holder_signing_message(
+        &self,
+        request: &CredentialRequest,
+    ) -> Result<Digest32, DeKyxError> {
+        Ok(digest_fields(
+            b"DEKYX:HOLDER-ISSUANCE:v2",
+            &[
+                &request.statement_digest()?,
+                &self.announcement_commitment,
+                &self.response_subject,
+                &self.response_blinding,
+            ],
+        ))
+    }
+
     fn verify(&self, request: &CredentialRequest) -> Result<(), DeKyxError> {
+        MlDsa65Verifier
+            .verify(
+                KeyPurpose::Attestation,
+                &request.holder_public_key,
+                &self.holder_signing_message(request)?,
+                &self.holder_signature,
+            )
+            .map_err(|_| DeKyxError::InvalidIssuanceProof)?;
         let commitment = decompress_non_identity(request.subject_commitment)?;
         let announcement = decompress_point(self.announcement_commitment)?;
         let response_subject = canonical_scalar(self.response_subject)?;
@@ -769,6 +861,8 @@ impl CredentialIssuer {
             issuer_key_epoch: self.definition.key_epoch,
             subject_kind: request.subject_kind,
             subject_commitment: request.subject_commitment,
+            holder_public_key: request.holder_public_key,
+            holder_suite: request.holder_suite,
             scope_digest: request.scope_digest,
             policy_digest: request.policy_digest,
             qualifications_root: qualification_root(&request.qualifications)?,
@@ -947,6 +1041,7 @@ pub struct AnonymousPresentation {
     pub announcement_nullifier: [u8; 32],
     pub response_subject: [u8; 32],
     pub response_blinding: [u8; 32],
+    pub holder_signature: Vec<u8>,
 }
 
 impl AnonymousPresentation {
@@ -958,6 +1053,8 @@ impl AnonymousPresentation {
         rng: &mut R,
     ) -> Result<Self, DeKyxError> {
         if credential.subject_commitment != witness.subject_commitment()
+            || credential.holder_public_key != witness.holder_public_key()
+            || credential.holder_suite != witness.holder_suite()
             || credential.scope_digest != context.scope_digest
             || context.valid_until > credential.valid_until
         {
@@ -985,7 +1082,7 @@ impl AnonymousPresentation {
             &announcement_commitment,
             &announcement_nullifier,
         )?;
-        Ok(Self {
+        let mut presentation = Self {
             credential,
             context,
             qualifications,
@@ -994,12 +1091,28 @@ impl AnonymousPresentation {
             announcement_nullifier,
             response_subject: (nonce_subject + challenge * witness.subject_secret).to_bytes(),
             response_blinding: (nonce_blinding + challenge * witness.blinding).to_bytes(),
-        })
+            holder_signature: Vec::new(),
+        };
+        presentation.holder_signature = witness
+            .holder_key
+            .sign(KeyPurpose::Order, &presentation.holder_signing_message()?)
+            .map_err(|_| DeKyxError::InvalidAnonymousProof)?;
+        Ok(presentation)
     }
 
     pub fn digest(&self) -> Result<Digest32, DeKyxError> {
+        if self.holder_signature.len() != ML_DSA_65_SIG_BYTES {
+            return Err(DeKyxError::InvalidAnonymousProof);
+        }
+        Ok(digest_fields(
+            PRESENTATION_DOMAIN,
+            &[&self.holder_signing_message()?, &self.holder_signature],
+        ))
+    }
+
+    pub fn holder_signing_message(&self) -> Result<Digest32, DeKyxError> {
         let mut hash = Sha256::new();
-        hash.update(PRESENTATION_DOMAIN);
+        hash.update(b"DEKYX:HOLDER-PRESENTATION:v2");
         hash.update(self.credential.digest()?);
         hash.update(self.context.digest()?);
         hash.update(self.nullifier);
@@ -1007,10 +1120,12 @@ impl AnonymousPresentation {
         hash.update(self.announcement_nullifier);
         hash.update(self.response_subject);
         hash.update(self.response_blinding);
+        hash.update((self.qualifications.len() as u64).to_be_bytes());
         for proof in &self.qualifications {
             hash.update(proof.qualification.leaf_digest()?);
             hash.update(proof.index.to_be_bytes());
             hash.update(proof.total.to_be_bytes());
+            hash.update((proof.siblings.len() as u64).to_be_bytes());
             for sibling in &proof.siblings {
                 hash.update(sibling);
             }
@@ -1029,6 +1144,14 @@ impl AnonymousPresentation {
     }
 
     fn verify_proof(&self) -> Result<(), DeKyxError> {
+        MlDsa65Verifier
+            .verify(
+                KeyPurpose::Order,
+                &self.credential.holder_public_key,
+                &self.holder_signing_message()?,
+                &self.holder_signature,
+            )
+            .map_err(|_| DeKyxError::InvalidAnonymousProof)?;
         let commitment = decompress_non_identity(self.credential.subject_commitment)?;
         let nullifier = decompress_non_identity(self.nullifier)?;
         let announce_commitment = decompress_point(self.announcement_commitment)?;

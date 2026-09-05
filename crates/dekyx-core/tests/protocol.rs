@@ -55,16 +55,25 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
         },
     ];
     let required = qualifications[1].clone();
-    let witness = CredentialWitness::random(qualifications.clone(), &mut OsRng).unwrap();
+    let holder_seed = [91; 32];
+    let witness = CredentialWitness::from_scalars_with_holder(
+        curve25519_dalek::scalar::Scalar::from(41_u64),
+        curve25519_dalek::scalar::Scalar::from(42_u64),
+        qualifications.clone(),
+        zkfmi_crypto::backend::MlDsa65Signer::from_seed(&holder_seed),
+    )
+    .unwrap();
     let credential_request = CredentialRequest {
         credential_id: id(6),
         issuer_id: id(1),
         issuer_key_epoch: 1,
         subject_kind: SubjectKind::LegalEntity,
         subject_commitment: witness.subject_commitment(),
+        holder_public_key: witness.holder_public_key(),
+        holder_suite: witness.holder_suite(),
         scope_digest: id(7),
         policy_digest: id(8),
-        qualifications,
+        qualifications: qualifications.clone(),
         status_epoch: 2,
         valid_from: 100,
         valid_until: 900,
@@ -72,6 +81,26 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
     let issuance_proof = witness
         .prove_issuance(&credential_request, &mut OsRng)
         .unwrap();
+    let mut unsigned_holder = issuance_proof.clone();
+    unsigned_holder.holder_signature.clear();
+    assert_eq!(
+        issuer.issue(credential_request.clone(), unsigned_holder),
+        Err(DeKyxError::InvalidIssuanceProof)
+    );
+    let mut forged_curve = issuance_proof.clone();
+    forged_curve.response_subject[0] ^= 1;
+    forged_curve.holder_signature = zkfmi_crypto::traits::Signer::sign(
+        &zkfmi_crypto::backend::MlDsa65Signer::from_seed(&holder_seed),
+        zkfmi_crypto::key::KeyPurpose::Attestation,
+        &forged_curve
+            .holder_signing_message(&credential_request)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        issuer.issue(credential_request.clone(), forged_curve),
+        Err(DeKyxError::InvalidIssuanceProof)
+    );
     let credential = issuer.issue(credential_request, issuance_proof).unwrap();
     let status = issuer.issue_status_list(3, 100, 950, vec![]).unwrap();
     let mut registry = IssuerRegistry::default();
@@ -143,6 +172,52 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
             Err(DeKyxError::InvalidStatusListSignature),
         );
     }
+    for mutation in 0..3 {
+        let mut changed = proof.clone();
+        match mutation {
+            0 => changed.holder_signature.clear(),
+            1 => changed.holder_signature[0] ^= 1,
+            2 => {
+                changed.holder_signature.pop().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            verifier.verify_eligibility(&requirement, &context, &changed, 200),
+            Err(DeKyxError::InvalidAnonymousProof)
+        );
+    }
+    let mut forged_curve = proof.clone();
+    forged_curve.response_subject[0] ^= 1;
+    forged_curve.holder_signature = zkfmi_crypto::traits::Signer::sign(
+        &zkfmi_crypto::backend::MlDsa65Signer::from_seed(&holder_seed),
+        zkfmi_crypto::key::KeyPurpose::Order,
+        &forged_curve.holder_signing_message().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        verifier.verify_eligibility(&requirement, &context, &forged_curve, 200),
+        Err(DeKyxError::InvalidAnonymousProof)
+    );
+
+    // Knowing both curve scalars is insufficient without the independent holder key.
+    let curve_only = CredentialWitness::from_scalars_with_holder(
+        curve25519_dalek::scalar::Scalar::from(41_u64),
+        curve25519_dalek::scalar::Scalar::from(42_u64),
+        qualifications,
+        zkfmi_crypto::backend::MlDsa65Signer::from_seed(&[92; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        AnonymousPresentation::create(
+            credential.clone(),
+            &curve_only,
+            context.clone(),
+            std::slice::from_ref(&required),
+            &mut OsRng,
+        ),
+        Err(DeKyxError::MismatchedWitnessOrContext)
+    );
     let mut ledger = PresentationLedger::default();
     ledger
         .consume(&verified.subject_nullifier, &context)
@@ -237,6 +312,8 @@ fn issuance_rejects_a_commitment_not_opened_by_the_holder_proof() {
         issuer_key_epoch: 1,
         subject_kind: SubjectKind::LegalEntity,
         subject_commitment: holder.subject_commitment(),
+        holder_public_key: holder.holder_public_key(),
+        holder_suite: holder.holder_suite(),
         scope_digest: id(34),
         policy_digest: id(35),
         qualifications: vec![qualification],
@@ -293,6 +370,8 @@ fn issue_for(
         issuer_key_epoch: definition.key_epoch,
         subject_kind: SubjectKind::LegalEntity,
         subject_commitment: witness.subject_commitment(),
+        holder_public_key: witness.holder_public_key(),
+        holder_suite: witness.holder_suite(),
         scope_digest: id(scope),
         policy_digest: id(policy),
         qualifications: vec![qualification.clone()],
@@ -498,6 +577,7 @@ fn different_scopes_are_not_publicly_linkable() {
     };
     let witness_a = CredentialWitness::random(vec![qualification.clone()], &mut OsRng).unwrap();
     let witness_b = witness_a.rerandomize(&mut OsRng);
+    assert_ne!(witness_a.holder_public_key(), witness_b.holder_public_key());
     let credential_a = issue_for(&issuer, &definition, &witness_a, &qualification, 53, 54, 55);
     let credential_b = issue_for(&issuer, &definition, &witness_b, &qualification, 56, 57, 55);
     assert_ne!(
