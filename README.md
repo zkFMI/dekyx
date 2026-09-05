@@ -26,7 +26,7 @@ implementation and has not been audited or certified as a KYC/KYB system.
 - Issuer-key rotation with grace periods and an immediate compromise path.
 - Replay prevention using the presentation nullifier and exact context.
 - Validated persistence formats for issuer directories and replay ledgers.
-- A small optional adapter for Aethel credit and guarantee artifacts.
+- A verified-result API for application-owned eligibility adapters.
 
 ## Credential and presentation flow
 
@@ -123,22 +123,21 @@ instead of reimplementing credentials.
 ```mermaid
 flowchart TB
     CORE["dekyx-core\ncredential and presentation verification"]
-    AA["dekyx-aethel\noptional artifact binding"]
+    AA["aethel-dekyx\nowned by Aethel"]
     A["Aethel\ncredit and guarantee eligibility"]
     C["DeCCP\nclearing-member admission"]
     O["Other applications\npolicy-specific eligibility"]
 
-    CORE --> AA --> A
-    CORE --> C
-    CORE --> O
+    A --> AA --> CORE
+    C -->|EligibilityPort adapter| CORE
+    O --> CORE
     Z["zkPI / DeFMI"] -. "no direct credential dependency" .-> CORE
 ```
 
 | Module | Relationship |
 |---|---|
 | `dekyx-core` | Standalone credential, presentation, issuer, revocation, and replay implementation; no application dependency |
-| `dekyx-aethel` | Optional adapter that binds a verified presentation to an Aethel artifact |
-| Aethel | Imports `dekyx-core` and `dekyx-aethel` for credit decisions and guarantees |
+| Aethel | Owns `aethel-dekyx` in its repository and consumes `dekyx-core`; DeKYX never imports Aethel |
 | DeCCP | Consumes a verified result through its `EligibilityPort` when admitting a clearing member |
 | zkPI / DeFMI | Do not define credentials; a host may require DeKYX eligibility before creating or settling an instruction |
 
@@ -146,8 +145,7 @@ flowchart TB
 
 ```text
 crates/
-├── dekyx-core/     Issuers, credentials, qualification proofs, revocation, replay
-└── dekyx-aethel/   Optional binding for Aethel artifacts
+└── dekyx-core/     Issuers, credentials, qualification proofs, revocation, replay
 ```
 
 ## Enterprise PoC

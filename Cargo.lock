@@ -78,16 +78,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekyx-aethel"
-version = "0.1.0"
-dependencies = [
- "dekyx-core",
- "ed25519-dalek",
- "rand_core",
- "serde",
-]
-
-[[package]]
 name = "dekyx-core"
 version = "0.1.0"
 dependencies = [

@@ -77,7 +77,7 @@ cargo test --locked -p dekyx-core --test protocol \
 拒否する端から端までの基準事例はAethel adapter側にある。
 
 ```sh
-cargo test --locked -p dekyx-aethel --test adapter \
+cargo test --manifest-path ../aethel/Cargo.toml --locked -p aethel-dekyx --test adapter \
   revoked_wrong_context_or_foreign_issuer_evidence_is_rejected \
   -- --exact --nocapture
 ```
@@ -130,10 +130,10 @@ PoCでは少なくとも次を別プロセスまたは別権限で動かす。
 - presentation nullifierとcontext digest。
 
 DeKYX coreへAethel、DeCCP、DeFMI固有の型を入れない。固有の対応はadapter crateまたは
-ホストアプリに置く。Aethel接続の例は `dekyx-aethel` にある。
+ホストアプリに置く。Aethel接続の例は `aethel-dekyx` にある。
 
 ```sh
-cargo test --locked -p dekyx-aethel --test adapter -- --nocapture
+cargo test --manifest-path ../aethel/Cargo.toml --locked -p aethel-dekyx --test adapter -- --nocapture
 ```
 
 ## 6. 必須の拒否試験
@@ -210,12 +210,11 @@ DeKYXは確認済み証拠を最小開示で運ぶ層であり、証憑の真実
 
 ## 11. 実装されている範囲
 
-現在のworkspaceは二つのcrateからなる。
+現在のworkspaceは汎用の `dekyx-core` だけからなる。Aethel専用adapterはAethelリポジトリに移した。
 
 | crate | 提供するもの | 提供しないもの |
 |---|---|---|
 | `dekyx-core` | 発行者台帳、credential、資格の部分提示、匿名提示証明、失効、再送防止 | 実在確認、制裁照合、与信、清算、決済 |
-| `dekyx-aethel` | Aethelの要求をDeKYX検証条件へ写し、検証結果をAethel用recordへ変換 | Aethelの債権状態、与信判断、保証残高 |
 
 完成済みの本人確認SaaS、管理画面、証憑OCR、政府registry接続、HSM接続、REST API serverはこの
 workspaceに含まれない。企業PoCではcoreを基準に、発行者service、holder wallet、verifier service、
@@ -639,7 +638,7 @@ transaction log位置を結ぶ。
 
 ## 27. Aethelとの接続
 
-`dekyx-aethel` は、Aethelのcredit/guarantee artifactごとの要求を次へ写す。
+Aethelリポジトリの `aethel-dekyx` は、Aethelのcredit/guarantee artifactごとの要求を次へ写す。
 
 - request IDをscopeへ。
 - issuer provider IDとkey epoch。

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dekyx-core", "crates/dekyx-aethel"]
+members = ["crates/dekyx-core"]
 resolver = "2"
 
 [workspace.package]
