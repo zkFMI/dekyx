@@ -102,6 +102,58 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
         Err(DeKyxError::InvalidIssuanceProof)
     );
     let credential = issuer.issue(credential_request, issuance_proof).unwrap();
+    let recovery_seed = [83; 96]; // Public test fixture, never operator key material.
+    let recovery = zkfmi_crypto::hybrid::kem::HybridKemKey::from_seed(&recovery_seed);
+    let custody = witness
+        .seal_custody(
+            &credential,
+            &zkfmi_crypto::traits::KemDecapsulator::public_key(&recovery),
+            id(85),
+        )
+        .unwrap();
+    // Exercise the actual persisted bytes and restore independent key handles.
+    let directory = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap())
+        .join(format!("dekyx-custody-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("credential-witness.json");
+    std::fs::write(&path, serde_json::to_vec(&custody).unwrap()).unwrap();
+    let saved: dekyx_core::EncryptedCredentialWitness =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    drop(recovery);
+    let recovered_key = zkfmi_crypto::hybrid::kem::HybridKemKey::from_seed(&recovery_seed);
+    assert!(saved.restore(&credential, &recovered_key, &id(86)).is_err());
+    assert!(saved
+        .restore(
+            &credential,
+            &zkfmi_crypto::hybrid::kem::HybridKemKey::generate().unwrap(),
+            &id(85)
+        )
+        .is_err());
+    let mut substituted_credential = credential.clone();
+    substituted_credential.credential_id = id(87);
+    assert!(saved
+        .restore(&substituted_credential, &recovered_key, &id(85))
+        .is_err());
+    for component in 0..5 {
+        let mut tampered = saved.clone();
+        match component {
+            0 => tampered.sealed.kem_ciphertext[0] ^= 1,
+            1 => tampered.sealed.kem_ciphertext[32] ^= 1,
+            2 => tampered.sealed.ciphertext[0] ^= 1,
+            3 => tampered.sealed.tag[0] ^= 1,
+            _ => tampered.sealed.purpose = zkfmi_crypto::sealed::SealingPurpose::NoteOpening,
+        }
+        assert!(tampered
+            .restore(&credential, &recovered_key, &id(85))
+            .is_err());
+    }
+    let original_nullifier = witness.scope_nullifier(&id(7));
+    drop(witness);
+    let witness = saved.restore(&credential, &recovered_key, &id(85)).unwrap();
+    assert_eq!(witness.scope_nullifier(&id(7)), original_nullifier);
+    assert_eq!(witness.holder_public_key(), credential.holder_public_key);
     let status = issuer.issue_status_list(3, 100, 950, vec![]).unwrap();
     let mut registry = IssuerRegistry::default();
     registry.register(definition).unwrap();

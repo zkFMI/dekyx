@@ -25,6 +25,9 @@ use zkfmi_crypto::{
     traits::{SecretBytes, Signer as _, Verifier as _},
 };
 
+mod custody;
+pub use custody::EncryptedCredentialWitness;
+
 pub type Digest32 = [u8; 32];
 pub type Identifier = [u8; 32];
 pub const ZERO: [u8; 32] = [0; 32];
