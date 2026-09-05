@@ -12,19 +12,26 @@ use curve25519_dalek::{
     scalar::Scalar,
     traits::IsIdentity,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
+use zkfmi_crypto::{
+    backend::{Ed25519Signer, MlDsa65Signer},
+    hybrid::signature::{HybridSignature, HybridSigner, HybridVerifier},
+    key::KeyPurpose,
+    suite::{Suite, SuiteId, ML_DSA_65_PK_BYTES},
+    traits::Signer as _,
+};
 
 pub type Digest32 = [u8; 32];
 pub type Identifier = [u8; 32];
 pub const ZERO: [u8; 32] = [0; 32];
-const CREDENTIAL_DOMAIN: &[u8] = b"DEKYX:CREDENTIAL:v1";
+const CREDENTIAL_DOMAIN: &[u8] = b"DEKYX:CREDENTIAL:v2";
 const ISSUANCE_REQUEST_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-REQUEST:v1";
 const ISSUANCE_PROOF_DOMAIN: &[u8] = b"DEKYX:ISSUANCE-PROOF:v1";
-const STATUS_DOMAIN: &[u8] = b"DEKYX:STATUS-LIST:v1";
+const STATUS_DOMAIN: &[u8] = b"DEKYX:STATUS-LIST:v2";
 const CONTEXT_DOMAIN: &[u8] = b"DEKYX:PRESENTATION-CONTEXT:v1";
 const PROOF_DOMAIN: &[u8] = b"DEKYX:ANONYMOUS-PRESENTATION:v1";
 const PRESENTATION_DOMAIN: &[u8] = b"DEKYX:PRESENTATION-DIGEST:v1";
@@ -74,6 +81,8 @@ pub struct IssuerDefinition {
     pub issuer_id: Identifier,
     pub key_epoch: u64,
     pub public_key: [u8; 32],
+    pub pq_public_key: Vec<u8>,
+    pub signature_suite: Suite,
     pub supported_subjects: BTreeSet<SubjectKind>,
     pub namespace_digest: Digest32,
     pub valid_from: u64,
@@ -85,6 +94,9 @@ impl IssuerDefinition {
     pub fn validate(&self) -> Result<(), DeKyxError> {
         if [self.issuer_id, self.public_key, self.namespace_digest].contains(&ZERO)
             || self.key_epoch == 0
+            || self.signature_suite != Suite::new(SuiteId::Ed25519MlDsa65)
+            || self.pq_public_key.len() != ML_DSA_65_PK_BYTES
+            || self.pq_public_key.iter().all(|byte| *byte == 0)
             || self.supported_subjects.is_empty()
             || self.valid_from == 0
             || self.valid_from > self.valid_until
@@ -93,6 +105,10 @@ impl IssuerDefinition {
         }
         VerifyingKey::from_bytes(&self.public_key).map_err(|_| DeKyxError::InvalidIssuerKey)?;
         Ok(())
+    }
+
+    fn hybrid_public_key(&self) -> Vec<u8> {
+        [self.public_key.as_slice(), self.pq_public_key.as_slice()].concat()
     }
 
     pub fn active_for(&self, kind: SubjectKind, now: u64) -> bool {
@@ -249,7 +265,10 @@ impl IssuerDirectory {
             .latest_epoch(&next.issuer_id)
             .ok_or(DeKyxError::UnknownIssuer)?;
         let current = self.registry.issuer(&next.issuer_id, latest)?;
-        if next.key_epoch <= latest || next.public_key == current.public_key {
+        if next.key_epoch <= latest
+            || next.public_key == current.public_key
+            || next.pq_public_key == current.pq_public_key
+        {
             return Err(DeKyxError::InvalidKeyRotation);
         }
         let next_id = next.issuer_id;
@@ -433,22 +452,27 @@ impl QualificationProof {
 pub struct SignatureBytes {
     pub first: [u8; 32],
     pub second: [u8; 32],
+    pub pq: Vec<u8>,
 }
 
 impl SignatureBytes {
-    fn from_signature(signature: Signature) -> Self {
-        let bytes = signature.to_bytes();
+    fn from_signature(signature: HybridSignature) -> Self {
         Self {
-            first: bytes[..32].try_into().expect("fixed signature half"),
-            second: bytes[32..].try_into().expect("fixed signature half"),
+            first: signature.classical[..32]
+                .try_into()
+                .expect("fixed signature half"),
+            second: signature.classical[32..]
+                .try_into()
+                .expect("fixed signature half"),
+            pq: signature.pq,
         }
     }
 
-    fn signature(&self) -> Signature {
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&self.first);
-        bytes[32..].copy_from_slice(&self.second);
-        Signature::from_bytes(&bytes)
+    fn signature(&self) -> HybridSignature {
+        HybridSignature {
+            classical: [self.first.as_slice(), self.second.as_slice()].concat(),
+            pq: self.pq.clone(),
+        }
     }
 }
 
@@ -507,13 +531,24 @@ impl Credential {
     pub fn digest(&self) -> Result<Digest32, DeKyxError> {
         let mut hash = Sha256::new();
         hash.update(self.statement_digest()?);
-        hash.update(self.signature.first);
-        hash.update(self.signature.second);
+        hash.update(
+            self.signature
+                .signature()
+                .encode()
+                .map_err(|_| DeKyxError::InvalidCredentialSignature)?,
+        );
         Ok(hash.finalize().into())
     }
 
-    fn verify_signature(&self, key: &VerifyingKey) -> Result<(), DeKyxError> {
-        key.verify(&self.statement_digest()?, &self.signature.signature())
+    fn verify_signature(&self, issuer: &IssuerDefinition) -> Result<(), DeKyxError> {
+        issuer.validate()?;
+        HybridVerifier
+            .verify_hybrid(
+                KeyPurpose::Attestation,
+                &issuer.hybrid_public_key(),
+                &self.statement_digest()?,
+                &self.signature.signature(),
+            )
             .map_err(|_| DeKyxError::InvalidCredentialSignature)
     }
 }
@@ -612,7 +647,7 @@ impl CredentialWitness {
 
 pub struct CredentialIssuer {
     definition: IssuerDefinition,
-    signing_key: SigningKey,
+    signing_key: HybridSigner,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -694,9 +729,14 @@ impl CredentialIssuanceProof {
 }
 
 impl CredentialIssuer {
-    pub fn new(definition: IssuerDefinition, signing_key: SigningKey) -> Result<Self, DeKyxError> {
+    pub fn new(
+        definition: IssuerDefinition,
+        signing_key: SigningKey,
+        pq_signing_key: MlDsa65Signer,
+    ) -> Result<Self, DeKyxError> {
         definition.validate()?;
-        if definition.public_key != signing_key.verifying_key().to_bytes() {
+        let signing_key = HybridSigner::new(Ed25519Signer::from_key(signing_key), pq_signing_key);
+        if definition.hybrid_public_key() != signing_key.public_key() {
             return Err(DeKyxError::InvalidIssuerKey);
         }
         Ok(Self {
@@ -738,10 +778,14 @@ impl CredentialIssuer {
             signature: SignatureBytes {
                 first: ZERO,
                 second: ZERO,
+                pq: Vec::new(),
             },
         };
-        credential.signature =
-            SignatureBytes::from_signature(self.signing_key.sign(&credential.statement_digest()?));
+        credential.signature = SignatureBytes::from_signature(
+            self.signing_key
+                .sign_hybrid(KeyPurpose::Attestation, &credential.statement_digest()?)
+                .map_err(|_| DeKyxError::InvalidCredentialSignature)?,
+        );
         Ok(credential)
     }
 
@@ -762,11 +806,15 @@ impl CredentialIssuer {
             signature: SignatureBytes {
                 first: ZERO,
                 second: ZERO,
+                pq: Vec::new(),
             },
         };
         list.canonicalize()?;
-        list.signature =
-            SignatureBytes::from_signature(self.signing_key.sign(&list.statement_digest()?));
+        list.signature = SignatureBytes::from_signature(
+            self.signing_key
+                .sign_hybrid(KeyPurpose::Attestation, &list.statement_digest()?)
+                .map_err(|_| DeKyxError::InvalidStatusListSignature)?,
+        );
         Ok(list)
     }
 }
@@ -839,9 +887,14 @@ impl RevocationStatusList {
         if self.issuer_id != issuer.issuer_id || self.issuer_key_epoch != issuer.key_epoch {
             return Err(DeKyxError::InvalidStatusList);
         }
-        VerifyingKey::from_bytes(&issuer.public_key)
-            .map_err(|_| DeKyxError::InvalidIssuerKey)?
-            .verify(&self.statement_digest()?, &self.signature.signature())
+        issuer.validate()?;
+        HybridVerifier
+            .verify_hybrid(
+                KeyPurpose::Attestation,
+                &issuer.hybrid_public_key(),
+                &self.statement_digest()?,
+                &self.signature.signature(),
+            )
             .map_err(|_| DeKyxError::InvalidStatusListSignature)
     }
 }
@@ -1082,9 +1135,7 @@ impl EligibilityProvider for DeKyxVerifier<'_> {
         if issuer.namespace_digest != requirement.issuer_namespace_digest {
             return Err(DeKyxError::IssuerNotAuthorized);
         }
-        let key = VerifyingKey::from_bytes(&issuer.public_key)
-            .map_err(|_| DeKyxError::InvalidIssuerKey)?;
-        evidence.credential.verify_signature(&key)?;
+        evidence.credential.verify_signature(issuer)?;
         self.status_list.verify(issuer, now)?;
         if self.status_list.status_epoch < evidence.credential.status_epoch {
             return Err(DeKyxError::StaleStatusList);

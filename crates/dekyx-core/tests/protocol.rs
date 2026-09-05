@@ -20,13 +20,26 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
         issuer_id: id(1),
         key_epoch: 1,
         public_key: signing.verifying_key().to_bytes(),
+        pq_public_key: zkfmi_crypto::traits::Signer::public_key(
+            &zkfmi_crypto::test_support::public_fixture_pq_key(
+                &(signing.verifying_key().to_bytes()),
+            ),
+        ),
+        signature_suite: zkfmi_crypto::suite::Suite::new(
+            zkfmi_crypto::suite::SuiteId::Ed25519MlDsa65,
+        ),
         supported_subjects: BTreeSet::from([SubjectKind::LegalEntity]),
         namespace_digest: id(2),
         valid_from: 100,
         valid_until: 1_000,
         status: IssuerStatus::Active,
     };
-    let issuer = CredentialIssuer::new(definition.clone(), signing).unwrap();
+    let issuer = CredentialIssuer::new(
+        definition.clone(),
+        (signing).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(&(signing).verifying_key().to_bytes()),
+    )
+    .unwrap();
     let qualifications = vec![
         Qualification {
             namespace: "global.lei".into(),
@@ -96,6 +109,40 @@ fn selective_qualification_proof_hides_other_attributes_and_consumes_context_onc
     let verified = verifier
         .verify_eligibility(&requirement, &context, &proof, 200)
         .unwrap();
+    for mutation in 0..4 {
+        let mut changed = proof.clone();
+        match mutation {
+            0 => changed.credential.signature.first[0] ^= 1,
+            1 => changed.credential.signature.pq[0] ^= 1,
+            2 => {
+                changed.credential.signature.pq.pop().unwrap();
+            }
+            3 => changed.credential.signature.pq.clear(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            verifier.verify_eligibility(&requirement, &context, &changed, 200),
+            Err(DeKyxError::InvalidCredentialSignature),
+            "accepted credential with only one valid signature component",
+        );
+    }
+    for mutation in 0..3 {
+        let mut changed = status.clone();
+        match mutation {
+            0 => changed.signature.first[0] ^= 1,
+            1 => changed.signature.pq[0] ^= 1,
+            2 => changed.signature.pq.clear(),
+            _ => unreachable!(),
+        }
+        let changed_verifier = DeKyxVerifier {
+            issuers: &registry,
+            status_list: &changed,
+        };
+        assert_eq!(
+            changed_verifier.verify_eligibility(&requirement, &context, &proof, 200),
+            Err(DeKyxError::InvalidStatusListSignature),
+        );
+    }
     let mut ledger = PresentationLedger::default();
     ledger
         .consume(&verified.subject_nullifier, &context)
@@ -127,6 +174,12 @@ fn duplicate_issuer_epoch_does_not_replace_the_existing_trust_anchor() {
         issuer_id: id(20),
         key_epoch: 5,
         public_key: key.verifying_key().to_bytes(),
+        pq_public_key: zkfmi_crypto::traits::Signer::public_key(
+            &zkfmi_crypto::test_support::public_fixture_pq_key(&(key.verifying_key().to_bytes())),
+        ),
+        signature_suite: zkfmi_crypto::suite::Suite::new(
+            zkfmi_crypto::suite::SuiteId::Ed25519MlDsa65,
+        ),
         supported_subjects: BTreeSet::from([SubjectKind::Person]),
         namespace_digest: id(21),
         valid_from: 1,
@@ -152,13 +205,26 @@ fn issuance_rejects_a_commitment_not_opened_by_the_holder_proof() {
         issuer_id: id(30),
         key_epoch: 1,
         public_key: signing.verifying_key().to_bytes(),
+        pq_public_key: zkfmi_crypto::traits::Signer::public_key(
+            &zkfmi_crypto::test_support::public_fixture_pq_key(
+                &(signing.verifying_key().to_bytes()),
+            ),
+        ),
+        signature_suite: zkfmi_crypto::suite::Suite::new(
+            zkfmi_crypto::suite::SuiteId::Ed25519MlDsa65,
+        ),
         supported_subjects: BTreeSet::from([SubjectKind::LegalEntity]),
         namespace_digest: id(31),
         valid_from: 1,
         valid_until: 1_000,
         status: IssuerStatus::Active,
     };
-    let issuer = CredentialIssuer::new(definition, signing).unwrap();
+    let issuer = CredentialIssuer::new(
+        definition,
+        (signing).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(&(signing).verifying_key().to_bytes()),
+    )
+    .unwrap();
     let qualification = Qualification {
         namespace: "global.lei".into(),
         predicate_digest: id(32),
@@ -198,6 +264,12 @@ fn issuer_definition(
         issuer_id: id(issuer),
         key_epoch: epoch,
         public_key: key.verifying_key().to_bytes(),
+        pq_public_key: zkfmi_crypto::traits::Signer::public_key(
+            &zkfmi_crypto::test_support::public_fixture_pq_key(&(key.verifying_key().to_bytes())),
+        ),
+        signature_suite: zkfmi_crypto::suite::Suite::new(
+            zkfmi_crypto::suite::SuiteId::Ed25519MlDsa65,
+        ),
         supported_subjects: BTreeSet::from([SubjectKind::LegalEntity]),
         namespace_digest: id(namespace),
         valid_from: 1,
@@ -266,8 +338,20 @@ fn key_rotation_bounds_the_old_epoch_and_keeps_the_subject_line() {
     let second_key = SigningKey::generate(&mut OsRng);
     let first = issuer_definition(&first_key, 40, 1, 41, 1_000);
     let second = issuer_definition(&second_key, 40, 2, 41, 1_000);
-    let first_issuer = CredentialIssuer::new(first.clone(), first_key.clone()).unwrap();
-    let second_issuer = CredentialIssuer::new(second.clone(), second_key).unwrap();
+    let first_issuer = CredentialIssuer::new(
+        first.clone(),
+        (first_key.clone()).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(
+            &(first_key.clone()).verifying_key().to_bytes(),
+        ),
+    )
+    .unwrap();
+    let second_issuer = CredentialIssuer::new(
+        second.clone(),
+        (second_key).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(&(second_key).verifying_key().to_bytes()),
+    )
+    .unwrap();
     let qualification = Qualification {
         namespace: "jp.kyb".into(),
         predicate_digest: id(42),
@@ -402,7 +486,12 @@ fn key_rotation_bounds_the_old_epoch_and_keeps_the_subject_line() {
 fn different_scopes_are_not_publicly_linkable() {
     let key = SigningKey::generate(&mut OsRng);
     let definition = issuer_definition(&key, 50, 1, 51, 1_000);
-    let issuer = CredentialIssuer::new(definition.clone(), key).unwrap();
+    let issuer = CredentialIssuer::new(
+        definition.clone(),
+        (key).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(&(key).verifying_key().to_bytes()),
+    )
+    .unwrap();
     let qualification = Qualification {
         namespace: "jp.kyb".into(),
         predicate_digest: id(52),
@@ -490,7 +579,12 @@ fn different_scopes_are_not_publicly_linkable() {
 fn directory_rejects_stale_status_lists_and_reloads_only_validated_state() {
     let key = SigningKey::generate(&mut OsRng);
     let definition = issuer_definition(&key, 60, 1, 61, 1_000);
-    let issuer = CredentialIssuer::new(definition.clone(), key).unwrap();
+    let issuer = CredentialIssuer::new(
+        definition.clone(),
+        (key).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(&(key).verifying_key().to_bytes()),
+    )
+    .unwrap();
     let mut directory = IssuerDirectory::default();
     directory.register_issuer(definition.clone()).unwrap();
     let newer = issuer.issue_status_list(3, 1, 950, vec![id(62)]).unwrap();
@@ -508,7 +602,12 @@ fn directory_rejects_stale_status_lists_and_reloads_only_validated_state() {
     // A list signed by an unregistered epoch is refused.
     let stranger = CredentialIssuer::new(
         issuer_definition(&SigningKey::generate(&mut OsRng), 60, 2, 61, 1_000),
-        SigningKey::generate(&mut OsRng),
+        (SigningKey::generate(&mut OsRng)).clone(),
+        zkfmi_crypto::test_support::public_fixture_pq_key(
+            &(SigningKey::generate(&mut OsRng))
+                .verifying_key()
+                .to_bytes(),
+        ),
     );
     assert!(stranger.is_err());
 
@@ -534,4 +633,27 @@ fn directory_rejects_stale_status_lists_and_reloads_only_validated_state() {
     issuers.remove(&key_name);
     issuers.insert("00:1".into(), value);
     assert!(serde_json::from_value::<IssuerDirectory>(record).is_err());
+}
+
+#[test]
+fn issuer_rotation_requires_new_pq_material_and_legacy_records_fail_closed() {
+    let first = issuer_definition(&SigningKey::generate(&mut OsRng), 87, 1, 88, 1_000);
+    let mut next = issuer_definition(&SigningKey::generate(&mut OsRng), 87, 2, 88, 2_000);
+    let mut directory = IssuerDirectory::default();
+    directory.register_issuer(first.clone()).unwrap();
+    let before = serde_json::to_vec(&directory).unwrap();
+    next.pq_public_key = first.pq_public_key.clone();
+    assert_eq!(
+        directory.rotate_key(next, 500),
+        Err(DeKyxError::InvalidKeyRotation)
+    );
+    assert_eq!(serde_json::to_vec(&directory).unwrap(), before);
+
+    let mut legacy = serde_json::to_value(&first).unwrap();
+    legacy.as_object_mut().unwrap().remove("pqPublicKey");
+    assert!(serde_json::from_value::<IssuerDefinition>(legacy).is_err());
+    let mut unsupported = first;
+    unsupported.signature_suite =
+        zkfmi_crypto::suite::Suite::new(zkfmi_crypto::suite::SuiteId::Ed25519);
+    assert_eq!(unsupported.validate(), Err(DeKyxError::InvalidIssuer));
 }
