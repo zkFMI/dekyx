@@ -41,7 +41,7 @@ DeKYXは、人、法人、機器、サービス、AIエージェントなどが�
 ## 1. ソースと基準試験を固定する
 
 ```sh
-git clone https://github.com/shukob/dekyx.git
+git clone https://github.com/zkFMI/dekyx.git
 cd dekyx
 git checkout <社内で承認したcommit>
 git rev-parse HEAD
@@ -377,7 +377,7 @@ holderのsubject secretを発行者HSMへ置かない。holderまたは法人wal
 ## 17. ソースとbuild成果物を固定する
 
 ```sh
-git clone https://github.com/shukob/dekyx.git
+git clone https://github.com/zkFMI/dekyx.git
 cd dekyx
 git checkout <承認commit>
 git rev-parse HEAD
